@@ -26,10 +26,14 @@ namespace TFTP
 		FILE_MMAP_ERROR, 	 /* Failed to map a local file into memory */
 		SEND_REQ_ERROR,		 /* Error on request transmission */
 		SEND_ACK_ERROR,		 /* Error on ACK transmission */
+		SEND_ERR_FAILED,     /* Failed on ERROR transmission */
 		SET_SOCK_OPT_ERROR,  /* Error on setsockopt */
 		RECV_ERROR,   		 /* Failed to receive packets from server */
+		SEND_ERROR,   		 /* Failed to send file blocks to server */
 		OPERATION_TIMEOUT,   /* Read timeout */
-		UNDEF_ERROR,		 /* Generic error code, error cause might be set in message attribute*/
+		MAX_BLOCK_RETRANS,   /* Max number of retransmissions has been reached during put operation */
+		INVALID_LOCAL_FILE,  /* Local file is invalid, null, or provided file size is invalid */
+		UNDEF_ERROR,		 /* Generic error code, error cause might be set in message attribute */
 		NOTFOUND_ERROR,	     /* File not found */
 		ACCESS_ERROR,   	 /* Access violation */
 		NOSPACE_ERROR,		 /* Disk full or allocation exceeded */
@@ -158,7 +162,7 @@ namespace TFTP
 	}
 
 	constexpr uint8_t TFTP_DEFAULT_PORT{69};
-	const std::string TFTP_MODE_NETASCII = "netascii";
+	const std::string TFTP_MODE_NETASCII = "octet";
 	const size_t TFTP_MAX_ALLOWED_RQ_WQ_PATH_SIZE{
 		(SEGSIZE - ((TFTP_MODE_NETASCII.length() - 1) - 1) - (sizeof(tftphdr) - sizeof(tftphdr::th_u1)))
 	};

@@ -17,9 +17,6 @@
 
 using TFTP::TFTPClient;
 
-#define SOCKET_NOT_ASSERTED (m_sock_fd < 0)
-#define SOCKET_ASSERTED (m_sock_fd >= 0)
-
 /* Definition of the template specializations */
 template<>
 std::pair<TFTP::ErrorCode, std::vector<uint8_t>> TFTPClient::Get(const std::string& remote_path)
@@ -33,6 +30,28 @@ std::pair<TFTP::ErrorCode, std::string> TFTPClient::Get(const std::string& remot
 {
 	std::string container{};
 	return {GetRequest<std::string>(remote_path, container), container};
+}
+
+template<>
+const std::pair<TFTP::ErrorCode, std::string> TFTPClient::Put(const std::string& remote_path, const std::string& data)
+{
+	if(data.size() == 0)
+	{
+		return {TFTP::ErrorCode::INVALID_LOCAL_FILE, {}};
+	}
+
+	return PutRequest(remote_path, data, data.size() + 1);
+}
+
+template<>
+const std::pair<TFTP::ErrorCode, std::string> TFTPClient::Put(const std::string& remote_path, const std::vector<uint8_t>& data)
+{
+	if(data.size() == 0)
+	{
+		return {TFTP::ErrorCode::INVALID_LOCAL_FILE, {}};
+	}
+
+	return PutRequest(remote_path, data, data.size());
 }
 
 template<typename T>
@@ -108,14 +127,15 @@ void TFTPClient::Clear(std::ofstream& obj, const size_t buffer_size)
 }
 
 template<typename T>
-std::pair<uint8_t*, size_t> TFTPClient::ReadBlock(const T& file, const size_t block_num, const size_t file_size)
+std::pair<uint8_t*, uint16_t> TFTPClient::ReadBlock(const T& file, const size_t block_num, const size_t file_size)
 {
-	return ReadBlock(file.data(), block_num, file_size);
+	uint8_t * head_ptr = (uint8_t *)(file.data());
+	return ReadBlock(BufferPtrWrapper{head_ptr, head_ptr}, block_num, file_size);
 }
 template<>
-std::pair<uint8_t*, size_t> TFTPClient::ReadBlock(const BufferPtrWrapper& obj, const size_t block_num, const size_t file_size)
+std::pair<uint8_t*, uint16_t> TFTPClient::ReadBlock(const BufferPtrWrapper& obj, const size_t block_num, const size_t file_size)
 {
-	const size_t block_start_index{block_num * TFTP::TFTP_MAX_WR_PAYLOAD_SIZE};
+	const size_t block_start_index{block_num * SEGSIZE};
 	uint8_t* head_ptr{nullptr};
 	size_t read_size{0};
 
@@ -123,9 +143,9 @@ std::pair<uint8_t*, size_t> TFTPClient::ReadBlock(const BufferPtrWrapper& obj, c
 	{
 		head_ptr = obj.ptr_head + block_start_index;
 		// A whole block can be read from file
-		if((block_start_index + TFTP::TFTP_MAX_WR_PAYLOAD_SIZE) <= file_size)
+		if((block_start_index + SEGSIZE) <= file_size)
 		{
-			read_size = TFTP::TFTP_MAX_WR_PAYLOAD_SIZE;
+			read_size = SEGSIZE;
 		}
 		//Not a whole block can be read, but there is data to be read
 		else
@@ -141,36 +161,23 @@ std::pair<uint8_t*, size_t> TFTPClient::ReadBlock(const BufferPtrWrapper& obj, c
 	return {head_ptr, read_size};
 }
 
+template<>
+std::pair<uint8_t*, uint16_t> TFTPClient::ReadBlock(const std::string& file, const size_t block_num, const size_t file_size)
+{
+	uint8_t * head_ptr = (uint8_t *)(file.c_str());
+	return ReadBlock(BufferPtrWrapper{head_ptr, head_ptr}, block_num, file_size);
+}
 /* TFTP Methods */
 TFTPClient::TFTPClient(const std::string& server_address, const uint16_t server_port) : m_server_address{server_address}, m_server_port(server_port)
 {
-	std::shared_ptr<uint8_t> abc{};
-	abc.reset(new uint8_t[32]);
-	std::string str{};
-	std::vector<uint8_t> vec{};
-
-	AssertState();
+    AssertRemoteAddress();
 }
 
-TFTP::ErrorCode TFTPClient::AssertSocket()
+std::pair<TFTP::ErrorCode, SocketWrapper> TFTPClient::AssertSocket()
 {
-	if(SOCKET_NOT_ASSERTED)
-	{
-		m_sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
-
-		if(SOCKET_NOT_ASSERTED)
-		{
-			perror(__func__);
-		}
-		else
-		{
-			// Do nothing
-		}
-	}
-
-	return SOCKET_ASSERTED ? ErrorCode::NO_ERROR : ErrorCode::SOCKET_OPEN_FAILED;
+    SocketWrapper sock_fd{AF_INET, SOCK_DGRAM, 0};
+	return {sock_fd ? ErrorCode::NO_ERROR : ErrorCode::SOCKET_OPEN_FAILED, std::move(sock_fd)};
 }
-
 
 TFTP::ErrorCode TFTPClient::AssertRemoteAddress()
 {
@@ -201,13 +208,13 @@ TFTP::ErrorCode TFTPClient::AssertRemoteAddress()
 	return ErrorCode::NO_ERROR;
 }
 
-TFTP::ErrorCode TFTPClient::AssertState()
+std::pair<TFTP::ErrorCode, SocketWrapper> TFTPClient::AssertState()
 {
-	ErrorCode err_code = AssertSocket();
+    std::pair<TFTP::ErrorCode, SocketWrapper> err_code = AssertSocket();
 
-	if(err_code == ErrorCode::NO_ERROR)
+	if(err_code.first == ErrorCode::NO_ERROR)
 	{
-		err_code = m_init_status ? ErrorCode::NO_ERROR : AssertRemoteAddress();
+		err_code.first = m_init_status ? ErrorCode::NO_ERROR : AssertRemoteAddress();
 	}
 	else
 	{
@@ -247,22 +254,14 @@ TFTP::TFPT_PKT_RESULT TFTPClient::AssertPacket(const tftphdr& pkt, const ssize_t
 	}
 }
 
-TFTP::ErrorCode TFTPClient::ReadWriteRequest(const std::string& remote_path, const uint8_t op_code)
+TFTP::ErrorCode TFTPClient::ReadWriteRequest(const std::string& remote_path, const uint8_t op_code, const int sock_fd)
 {
-
-	ErrorCode err_code{AssertState()};
-
-	if(err_code != ErrorCode::NO_ERROR)
-	{
-		return err_code;
-	}
-
 	uint8_t snd_pkt[SEGSIZE]{0};
 	tftphdr* snd_pkt_hdr = reinterpret_cast<tftphdr*>(snd_pkt);
 
 	ssize_t packet_len = sizeof(tftphdr) - sizeof(tftphdr::th_u1);
 
-	err_code = AssertRemotePath(remote_path);
+	ErrorCode err_code = AssertRemotePath(remote_path);
 	if(err_code == ErrorCode::NO_ERROR)
 	{
 		//Read request opcode
@@ -279,25 +278,23 @@ TFTP::ErrorCode TFTPClient::ReadWriteRequest(const std::string& remote_path, con
 	}
 	else
 	{
-		printf("[%s] Error: Remote path %s too long: %ld, max allowed: %ld",
+		printf("[%s] Error: Remote path %s too long: %ld, max allowed: %ld\n",
 				__func__, remote_path.c_str(), remote_path.size(),
 				TFTP::TFTP_MAX_ALLOWED_RQ_WQ_PATH_SIZE);
 		return err_code;
 	}
 
-	const ssize_t sent_bytes = sendto(m_sock_fd, snd_pkt, packet_len, 0, (struct sockaddr *)&serv_addr, sizeof(serv_addr));
-	printf("[%s] Wrote %ld bytes from %ld packet bytes for RW/RQ\n", __func__, sent_bytes, packet_len);
-
+	const ssize_t sent_bytes = sendto(sock_fd, snd_pkt, packet_len, 0, (struct sockaddr *)&serv_addr, sizeof(serv_addr));
 	return (sent_bytes == packet_len) ? ErrorCode::NO_ERROR : ErrorCode::SEND_REQ_ERROR;
 }
 
-TFTP::ErrorCode TFTPClient::Ack(const uint16_t block_num)
+TFTP::ErrorCode TFTPClient::Ack(const uint16_t block_num, const int sock_fd, const sockaddr_in& server_sockaddr)
 {
 	tftphdr ack_header{};
 	ack_header.th_opcode = htons(ACK);
 	ack_header.th_block = htons(block_num);
-    ssize_t bytes_sent = sendto(m_sock_fd, &ack_header, TFTP::TFTP_RWA_HEADER_SIZE, 0,
-                                (struct sockaddr*)&serv_addr, sizeof(serv_addr));
+    ssize_t bytes_sent = sendto(sock_fd, &ack_header, TFTP::TFTP_RWA_HEADER_SIZE, 0,
+                                (struct sockaddr*)&server_sockaddr, sizeof(server_sockaddr));
 
     if(bytes_sent != TFTP::TFTP_RWA_HEADER_SIZE)
     {
@@ -308,7 +305,7 @@ TFTP::ErrorCode TFTPClient::Ack(const uint16_t block_num)
     return ErrorCode::NO_ERROR;
 }
 
-TFTP::ErrorCode TFTPClient::SigError(const uint16_t err_code)
+TFTP::ErrorCode TFTPClient::SigError(const uint16_t err_code, const int sock_fd, const sockaddr_in& server_sockaddr)
 {
 	uint8_t buffer[SEGSIZE]{0};
 	tftphdr* ack_header{reinterpret_cast<tftphdr*>(buffer)};
@@ -316,13 +313,13 @@ TFTP::ErrorCode TFTPClient::SigError(const uint16_t err_code)
 	ack_header->th_code = htons(err_code);
 	const std::string err_msg{TFTP::TFTPErrorCodeToString(err_code)};
 	strncpy(static_cast<char *>(ack_header->th_msg), err_msg.c_str(), TFTP::TFTP_MAX_WR_PAYLOAD_SIZE);
-    ssize_t bytes_sent = sendto(m_sock_fd, &ack_header, TFTP::TFTP_RWA_HEADER_SIZE + err_msg.length() + 1, 0,
-                                (struct sockaddr*)&serv_addr, sizeof(serv_addr));
+    ssize_t bytes_sent = sendto(sock_fd, &ack_header, TFTP::TFTP_RWA_HEADER_SIZE + err_msg.length() + 1, 0,
+                                (struct sockaddr*)&server_sockaddr, sizeof(server_sockaddr));
 
     if(bytes_sent != TFTP::TFTP_RWA_HEADER_SIZE)
     {
-    	perror("Failed to send ACK packet");
-    	return ErrorCode::SEND_ACK_ERROR;
+    	perror("Failed to send error packet");
+    	return ErrorCode::SEND_ERR_FAILED;
     }
 
     return ErrorCode::NO_ERROR;
@@ -331,238 +328,357 @@ TFTP::ErrorCode TFTPClient::SigError(const uint16_t err_code)
 template<typename T>
 TFTP::ErrorCode TFTPClient::GetRequest(const std::string& file_path, T& file, const size_t buffer_size)
 {
-	ErrorCode err_code = ReadWriteRequest(file_path, RRQ);
-	if(err_code != ErrorCode::NO_ERROR)
-	{
-		return err_code;
-	}
+    std::pair<TFTP::ErrorCode, SocketWrapper> state = AssertState();
+    if(state.first != ErrorCode::NO_ERROR)
+    {
 
-	//Set a receive timeout according to configured send timeout window
-	if(setsockopt(m_sock_fd, SOL_SOCKET, SO_RCVTIMEO, &m_recv_timeout_secs, sizeof(m_recv_timeout_secs)) != 0)
-	{
-		perror("Failed to set receive timeout window");
-		return ErrorCode::SET_SOCK_OPT_ERROR;
-	}
+        return state.first;
+    }
 
-	time_t last_valid_op_step = time(NULL);
-	socklen_t serv_addr_size = sizeof(serv_addr);
-	uint16_t expected_block_num{1};
-	bool ongoing_transfer{true};
+    TFTP::ErrorCode err_code = ReadWriteRequest(file_path, RRQ, state.second);
+    if(err_code != ErrorCode::NO_ERROR)
+    {
+        return err_code;
+    }
 
-	//Receive file or issue error
-	while(ongoing_transfer)
-	{
-		uint8_t buffer[SEGSIZE]{0};
-		tftphdr* rcv_pkt{reinterpret_cast<tftphdr*>(buffer)};
-		ssize_t read_size = recvfrom(m_sock_fd, buffer, sizeof(buffer), 0, (struct sockaddr *)&serv_addr, &serv_addr_size);
-		if(read_size != -1)
-		{
-			printf("[%s] Got %ld bytes from TFTP server\n", __func__, read_size);
-			const TFTP::TFPT_PKT_RESULT result = AssertPacket(*rcv_pkt, read_size);
-			bool valid_packet{false};
+    /*
+     * Copy the server address for main socket.
+     * The TFTP server allocates a new socket and this one
+     * will be used in subsequent requests.
+     * The copy is modified in recv_from, to this point forward
+     * all communications outgoing to the server for the specific file
+     * is conducted through this server port.
+     * */
+    socklen_t serv_addr_size = sizeof(serv_addr);
+    sockaddr_in server_allocated_sockaddr{serv_addr};
 
-			switch(result)
-			{
-				case TFTP::TFPT_PKT_RESULT::PKT_SIG_ERROR:
-				{
-					printf("[%s] Packet error signaled by server, error code: %d\n",__func__, ntohs(rcv_pkt->th_code));
-					//Invalidate any received data
-					Clear(file, buffer_size);
-					// An error message may be included to provide additional details about the error code
-					if(rcv_pkt->th_msg)
-					{
-						printf("[%s] TFTP server reported error message: %s\n", __func__, rcv_pkt->th_msg);
-						// Won't treat return code for errors in order to not overwrite first issued error
-						Assign(file, &buffer[TFTP::TFTP_RWA_HEADER_SIZE], read_size - TFTP::TFTP_RWA_HEADER_SIZE, buffer_size);
-						//Persist the reported error in class
-						m_last_reported_error_msg = std::string(reinterpret_cast<const char *>(&buffer[TFTP::TFTP_RWA_HEADER_SIZE]),
-								read_size - TFTP::TFTP_RWA_HEADER_SIZE);
-					}
-					return TFTP::ErrorCodeFromTFTPError(ntohs(rcv_pkt->th_code));
-				}
-				case TFTP::TFPT_PKT_RESULT::PKT_SIG_PENDING_DATA:
-				{
-					printf("[%s] Pending file data signaled by server, block number %d\n",__func__,
-							ntohs(rcv_pkt->th_block));
-					valid_packet = (ntohs(rcv_pkt->th_block) == expected_block_num);
-					break;
-				}
-				case TFTP::TFPT_PKT_RESULT::PKT_SIG_EOF:
-				{
-					printf("[%s] EOF signaled by server, block number: %d\n",__func__,
-							ntohs(rcv_pkt->th_block));
-					valid_packet = (ntohs(rcv_pkt->th_block) == expected_block_num);
-					break;
-				}
-				default:
-				{
-					printf("[%s] Unexpected assert packet returned: %s\n", __func__,
-							TFTP::TFPT_PKT_RESULT_ToString(result).c_str());
-					break;
-				}
-			}
+    //Cache receive timeout to ensure it cannot be changed during transfer
+    const timeval receive_timeout{m_recv_timeout_secs};
 
-			if(valid_packet)
-			{
-				const TFTP::ErrorCode append_err = Append(file, &buffer[TFTP::TFTP_RWA_HEADER_SIZE],
-								read_size - TFTP::TFTP_RWA_HEADER_SIZE, buffer_size);
-				if(append_err != TFTP::ErrorCode::NO_ERROR)
-				{
-					return append_err;
-				}
+    //Set a receive timeout according to configured send timeout window
+    if(setsockopt(state.second, SOL_SOCKET, SO_RCVTIMEO, &receive_timeout, sizeof(receive_timeout)) != 0)
+    {
+        perror("Failed to set receive timeout window");
+        return ErrorCode::SET_SOCK_OPT_ERROR;
+    }
 
-				printf("Sending ACK for block number %d\n", expected_block_num);
-				Ack(expected_block_num);
-				expected_block_num++;
-				last_valid_op_step = time(NULL);
-			}
-			else if(difftime(time(NULL), last_valid_op_step) > m_recv_timeout_secs.tv_sec)
-			{
-				printf("[%s] Receive operation has timeout after %ld seconds, aborting...\n",
-						__func__, m_recv_timeout_secs.tv_sec);
-				//Too many invalid packets, signal error and give up
-				SigError((result == TFTP::TFPT_PKT_RESULT::PKT_UNEXPECTED_OPCODE) ? EBADOP : EBADID);
-				return ErrorCode::OPERATION_TIMEOUT;
-			}
-			else
-			{
-				//Do nothing, wait for retransmission of a valid packet
-			}
+    time_t last_valid_op_step = time(NULL);
+    uint16_t expected_block_num{1};
+    bool ongoing_transfer{true};
 
-			ongoing_transfer = (result == TFTP::TFPT_PKT_RESULT::PKT_SIG_PENDING_DATA);
-		}
-		else
-		{
-			//Signal an error to prevent server from keep retransmission
-			SigError(EUNDEF);
-			const int sys_errno = errno;
-			perror("Failed to receive packet");
-			err_code = (sys_errno == EAGAIN) ? TFTP::ErrorCode::OPERATION_TIMEOUT : TFTP::ErrorCode::RECV_ERROR;
-			return err_code;
-		}
-	}
+    //Receive file or issue error
+    while(ongoing_transfer)
+    {
+        uint8_t buffer[SEGSIZE]{0};
+        tftphdr* rcv_pkt{reinterpret_cast<tftphdr*>(buffer)};
+        ssize_t read_size = recvfrom(state.second, buffer, sizeof(buffer), 0,
+                (struct sockaddr *)&server_allocated_sockaddr, &serv_addr_size);
+        if(read_size != -1)
+        {
+            const TFTP::TFPT_PKT_RESULT result = AssertPacket(*rcv_pkt, read_size);
+            bool valid_packet{false};
 
-	return TFTP::ErrorCode::NO_ERROR;
+            switch(result)
+            {
+                case TFTP::TFPT_PKT_RESULT::PKT_SIG_ERROR:
+                {
+                    printf("[%s] Packet error signaled by server, error code: %d\n",__func__, ntohs(rcv_pkt->th_code));
+                    //Invalidate any received data
+                    Clear(file, buffer_size);
+                    // An error message may be included to provide additional details about the error code
+                    if(rcv_pkt->th_msg)
+                    {
+                        printf("[%s] TFTP server reported error message: %s\n", __func__, rcv_pkt->th_msg);
+                        // Won't treat return code for errors in order to not overwrite first issued error
+                        Assign(file, &buffer[TFTP::TFTP_RWA_HEADER_SIZE], read_size - TFTP::TFTP_RWA_HEADER_SIZE, buffer_size);
+                        //Persist the reported error in class
+                        m_last_reported_error_msg = std::string(reinterpret_cast<const char *>(&buffer[TFTP::TFTP_RWA_HEADER_SIZE]),
+                                read_size - TFTP::TFTP_RWA_HEADER_SIZE);
+                    }
+                    return TFTP::ErrorCodeFromTFTPError(ntohs(rcv_pkt->th_code));
+                }
+                case TFTP::TFPT_PKT_RESULT::PKT_SIG_PENDING_DATA:
+                {
+                    printf("[%s] Pending file data signaled by server, block number %d\n",__func__,
+                            ntohs(rcv_pkt->th_block));
+                    valid_packet = (ntohs(rcv_pkt->th_block) == expected_block_num);
+                    break;
+                }
+                case TFTP::TFPT_PKT_RESULT::PKT_SIG_EOF:
+                {
+                    printf("[%s] EOF signaled by server, block number: %d\n",__func__,
+                            ntohs(rcv_pkt->th_block));
+                    valid_packet = (ntohs(rcv_pkt->th_block) == expected_block_num);
+                    break;
+                }
+                default:
+                {
+                    printf("[%s] Unexpected assert packet returned: %s\n", __func__,
+                            TFTP::TFPT_PKT_RESULT_ToString(result).c_str());
+                    break;
+                }
+            }
+
+            if(valid_packet)
+            {
+                const TFTP::ErrorCode append_err = Append(file, &buffer[TFTP::TFTP_RWA_HEADER_SIZE],
+                                read_size - TFTP::TFTP_RWA_HEADER_SIZE, buffer_size);
+                if(append_err != TFTP::ErrorCode::NO_ERROR)
+                {
+                    return append_err;
+                }
+
+                printf("Sending ACK for block number %d\n", expected_block_num);
+                Ack(expected_block_num, state.second, server_allocated_sockaddr);
+                expected_block_num++;
+                last_valid_op_step = time(NULL);
+            }
+            else if(difftime(time(NULL), last_valid_op_step) > receive_timeout.tv_sec)
+            {
+                printf("[%s] Receive operation has timeout after %ld seconds, aborting...\n",
+                        __func__, receive_timeout.tv_sec);
+                //Too many invalid packets, signal error and give up
+                SigError((result == TFTP::TFPT_PKT_RESULT::PKT_UNEXPECTED_OPCODE) ? EBADOP : EBADID, state.second, server_allocated_sockaddr);
+                return ErrorCode::OPERATION_TIMEOUT;
+            }
+            else
+            {
+                //Do nothing, wait for retransmission of a valid packet
+            }
+
+            ongoing_transfer = (result == TFTP::TFPT_PKT_RESULT::PKT_SIG_PENDING_DATA);
+        }
+        else
+        {
+            //Signal an error to prevent server from keep retransmission
+            SigError(EUNDEF, state.second, server_allocated_sockaddr);
+            const int sys_errno = errno;
+            perror("Failed to receive packet");
+            err_code = (sys_errno == EAGAIN) ? TFTP::ErrorCode::OPERATION_TIMEOUT : TFTP::ErrorCode::RECV_ERROR;
+            return err_code;
+        }
+    }
+
+    return TFTP::ErrorCode::NO_ERROR;
 }
 
 template<typename T>
-TFTP::ErrorCode TFTPClient::PutRequest(const std::string& file_path, T& file, const size_t buffer_size)
+std::pair<TFTP::ErrorCode, std::string>TFTPClient::PutRequest(const std::string& file_path, T& file, const size_t buffer_size)
 {
-	ErrorCode err_code = ReadWriteRequest(file_path, WRQ);
-	if(err_code != ErrorCode::NO_ERROR)
-	{
-		return err_code;
-	}
+    std::pair<TFTP::ErrorCode, SocketWrapper> state = AssertState();
+    if(state.first != ErrorCode::NO_ERROR)
+    {
+        return {state.first, {}};
+    }
 
-	//Set a receive timeout according to configured send timeout window
-	if(setsockopt(m_sock_fd, SOL_SOCKET, SO_RCVTIMEO, &m_recv_timeout_secs, sizeof(m_recv_timeout_secs)) != 0)
-	{
-		perror("Failed to set receive timeout window");
-		return ErrorCode::SET_SOCK_OPT_ERROR;
-	}
+    ErrorCode err_code = ReadWriteRequest(file_path, WRQ, state.second);
+    if(err_code != ErrorCode::NO_ERROR)
+    {
+        printf("err code: %d\n", (int) err_code);
+        return {err_code, {}};
+    }
 
-	time_t last_valid_op_step = time(NULL);
-	socklen_t serv_addr_size = sizeof(serv_addr);
-	uint16_t expected_block_num{1};
-	bool ongoing_transfer{true};
+    /*
+     * Copy the server address for main socket.
+     * The TFTP server allocates a new socket and this one
+     * will be used in subsequent requests.
+     * The copy is modified in recv_from, to this point forward
+     * all communications outgoing to the server for the specific file
+     * is conducted through this server port.
+     * */
+    socklen_t serv_addr_size = sizeof(serv_addr);
+    sockaddr_in server_allocated_sockaddr{serv_addr};
 
-	//Receive file or issue error
-	while(ongoing_transfer)
-	{
-		/* Transmit or retransmit block */
-		//ssize_t send_size = sendto(m_sock_fd, )
+    /*
+     * Cache send timeout, so its value is kept during this operation
+     * event if modified after operation has started
+     **/
+    const timeval send_timeout{m_send_timeout_secs};
 
-		uint8_t buffer[SEGSIZE]{0};
-		tftphdr* rcv_pkt{reinterpret_cast<tftphdr*>(buffer)};
-		ssize_t read_size = recvfrom(m_sock_fd, buffer, sizeof(buffer), 0, (struct sockaddr *)&serv_addr, &serv_addr_size);
-		if(read_size != -1)
-		{
-			printf("[%s] Got %ld bytes from TFTP server\n", __func__, read_size);
-			const TFTP::TFPT_PKT_RESULT result = AssertPacket(*rcv_pkt, read_size);
-			bool valid_packet{false};
+    //Set a receive timeout according to configured receive timeout window
+    if(setsockopt(state.second.GetSocketFD(), SOL_SOCKET, SO_RCVTIMEO, &send_timeout, sizeof(send_timeout)) != 0)
+    {
+        perror("Failed to set receive timeout window");
+        return {ErrorCode::SET_SOCK_OPT_ERROR, {}};
+    }
 
-			switch(result)
-			{
-				case TFTP::TFPT_PKT_RESULT::PKT_SIG_ERROR:
-				{
-					printf("[%s] Packet error signaled by server, error code: %d\n",__func__, ntohs(rcv_pkt->th_code));
-					//Invalidate any received data
-					//Clear(file, buffer_size);
-					// An error message may be included to provide additional details about the error code
-					if(rcv_pkt->th_msg)
-					{
-						printf("[%s] TFTP server reported error message: %s\n", __func__, rcv_pkt->th_msg);
-						// Won't treat return code for errors in order to not overwrite first issued error
-						//Assign(file, &buffer[TFTP::TFTP_RWA_HEADER_SIZE], read_size - TFTP::TFTP_RWA_HEADER_SIZE, buffer_size);
-						//Persist the reported error in class
-						m_last_reported_error_msg = std::string(reinterpret_cast<const char *>(&buffer[TFTP::TFTP_RWA_HEADER_SIZE]),
-								read_size - TFTP::TFTP_RWA_HEADER_SIZE);
-					}
-					return TFTP::ErrorCodeFromTFTPError(ntohs(rcv_pkt->th_code));
-				}
-				case TFTP::TFPT_PKT_RESULT::PKT_SIG_PENDING_DATA:
-				{
-					printf("[%s] Pending file data signaled by server, block number %d\n",__func__,
-							ntohs(rcv_pkt->th_block));
-					valid_packet = (ntohs(rcv_pkt->th_block) == expected_block_num);
-					break;
-				}
-				case TFTP::TFPT_PKT_RESULT::PKT_SIG_EOF:
-				{
-					printf("[%s] EOF signaled by server, block number: %d\n",__func__,
-							ntohs(rcv_pkt->th_block));
-					valid_packet = (ntohs(rcv_pkt->th_block) == expected_block_num);
-					break;
-				}
-				default:
-				{
-					printf("[%s] Unexpected assert packet returned: %s\n", __func__,
-							TFTP::TFPT_PKT_RESULT_ToString(result).c_str());
-					break;
-				}
-			}
+    time_t last_valid_op_step = time(NULL);
+    uint16_t last_client_acked_block{0};
+    size_t file_block_pos{0};
+    uint32_t retransmissions_count{0};
+    bool put_request_ack_status{false};
+    bool reached_eof{false};
+    bool ongoing_transfer{true};
 
-			if(valid_packet)
-			{
-//				const TFTP::ErrorCode append_err = Append(file, &buffer[TFTP::TFTP_RWA_HEADER_SIZE],
-//								read_size - TFTP::TFTP_RWA_HEADER_SIZE, buffer_size);
-//				if(append_err != TFTP::ErrorCode::NO_ERROR)
-//				{
-//					return append_err;
-//				}
+    //Receive file or issue error
+    while(ongoing_transfer)
+    {
+        uint8_t buffer[SEGSIZE]{0};
+        tftphdr* rcv_pkt{reinterpret_cast<tftphdr*>(buffer)};
+        ssize_t read_size = recvfrom(state.second, buffer, sizeof(buffer), 0, (struct sockaddr *)&server_allocated_sockaddr, &serv_addr_size);
+        if(read_size != -1)
+        {
+            const TFTP::TFPT_PKT_RESULT result = AssertPacket(*rcv_pkt, read_size);
+            bool valid_packet{false};
 
-				printf("Sending ACK for block number %d\n", expected_block_num);
-				Ack(expected_block_num);
-				expected_block_num++;
-				last_valid_op_step = time(NULL);
-			}
-			else if(difftime(time(NULL), last_valid_op_step) > m_recv_timeout_secs.tv_sec)
-			{
-				printf("[%s] Receive operation has timeout after %ld seconds, aborting...\n",
-						__func__, m_recv_timeout_secs.tv_sec);
-				//Too many invalid packets, signal error and give up
-				SigError((result == TFTP::TFPT_PKT_RESULT::PKT_UNEXPECTED_OPCODE) ? EBADOP : EBADID);
-				return ErrorCode::OPERATION_TIMEOUT;
-			}
-			else
-			{
-				//Do nothing, wait for retransmission of a valid packet
-			}
+            switch(result)
+            {
+                case TFTP::TFPT_PKT_RESULT::PKT_SIG_ERROR:
+                {
+                    std::string error_msg{};
+                    printf("[%s] Packet error signaled by server, error code: %d\n",__func__, ntohs(rcv_pkt->th_code));
+                    // An error message may be included to provide additional details about the error code
+                    if(rcv_pkt->th_msg)
+                    {
+                        printf("[%s] TFTP server reported error message: %s\n", __func__, rcv_pkt->th_msg);
+                        //Persist the reported error in class
+                        error_msg = std::string(reinterpret_cast<const char *>(&buffer[TFTP::TFTP_RWA_HEADER_SIZE]),
+                                read_size - TFTP::TFTP_RWA_HEADER_SIZE);
+                        m_last_reported_error_msg = error_msg;
+                    }
+                    return {TFTP::ErrorCodeFromTFTPError(ntohs(rcv_pkt->th_code)), error_msg};
+                }
+                case TFTP::TFPT_PKT_RESULT::PKT_SIG_ACK:
+                {
+                    valid_packet = true;
+                    const uint16_t server_acked_block_num = ntohs(rcv_pkt->th_block);
 
-			ongoing_transfer = (result == TFTP::TFPT_PKT_RESULT::PKT_SIG_PENDING_DATA);
-		}
-		else
-		{
-			//Signal an error to prevent server from keep retransmission
-			SigError(EUNDEF);
-			const int sys_errno = errno;
-			perror("Failed to receive packet");
-			err_code = (sys_errno == EAGAIN) ? TFTP::ErrorCode::OPERATION_TIMEOUT : TFTP::ErrorCode::RECV_ERROR;
-			return err_code;
-		}
-	}
+                    printf("[%s] Received ACK %d\n", __func__, server_acked_block_num);
 
-	return TFTP::ErrorCode::NO_ERROR;
+                    //Last block acknowledged is the last one sent
+                    if((last_client_acked_block + 1) == server_acked_block_num)
+                    {
+                        last_client_acked_block = ntohs(rcv_pkt->th_block);
+                        retransmissions_count = 0;
+                        printf("[%s] Server acknowledged block: %d\n", __func__, last_client_acked_block);
+
+                        //Keep transmitting next blocks
+                        if(reached_eof == false)
+                        {
+                            file_block_pos++;
+                        }
+                        //EOF reached, finish operation
+                        else
+                        {
+                            Ack(last_client_acked_block, state.second, server_allocated_sockaddr);
+                            ongoing_transfer = false;
+                            continue;
+                        }
+                    }
+                    //Server is requesting a block retransmission
+                    else if(put_request_ack_status)
+                    {
+                        printf("[%s] Server not acknowledged last sent block, retransmitting...\n", __func__);
+                        retransmissions_count++;
+
+                        // Check if max retransmissions attempts has been reached
+                        if(m_max_retransmissions && (retransmissions_count > m_max_retransmissions))
+                        {
+                            printf("[%s] Error reached max number of retransmissions on put request: %u",
+                                    __func__, m_max_retransmissions);
+                            SigError(EBADOP, state.second, server_allocated_sockaddr);
+                            return {TFTP::ErrorCode::MAX_BLOCK_RETRANS, {}};
+                        }
+
+                        //Only retransmit if the ACK block number, is the last ACK confirmed
+                        if (server_acked_block_num != last_client_acked_block)
+                        {
+                            continue;
+                        }
+                    }
+
+                    // A valid acknowledgment has been received
+                    put_request_ack_status = true;
+
+                    /* Transmit or retransmit block */
+                    const std::pair<uint8_t*, uint16_t> file_block{ReadBlock(file, file_block_pos, buffer_size)};
+                    uint8_t transmission_buffer[SEGSIZE]{0};
+                    tftphdr* transmission_segment = reinterpret_cast<tftphdr*>(transmission_buffer);
+                    transmission_segment->th_opcode = htons(DATA);
+                    transmission_segment->th_block = htons(last_client_acked_block + 1);
+
+                    /* Check if trying to read out of file bounds */
+                    if(file_block.first != nullptr)
+                    {
+                        memcpy(transmission_segment->th_data, file_block.first, file_block.second);
+                        reached_eof = (file_block.second > 0 && file_block.second < SEGSIZE);
+                    }
+                    else
+                    {
+                        /*
+                         * The server has not detected the EOF since the last block took the whole segment.
+                         * In this particular case send an empty header on next block.
+                         * */
+                        if((file_block_pos*SEGSIZE) == buffer_size)
+                        {
+                            reached_eof = true;
+                        }
+                        else
+                        {
+                            printf("[%s] Error: trying to read out of bound of provided file, block number %d, buffer_size: %ld\n",
+                                    __func__, last_client_acked_block, buffer_size);
+                            SigError(EACCESS, state.second, server_allocated_sockaddr);
+                            return {TFTP::ErrorCode::INVALID_LOCAL_FILE, {}};
+                        }
+                    }
+
+                    printf("[%s] Transmitting block number %ld\n", __func__, file_block_pos + 1);
+                    const ssize_t segment_size{file_block.second + TFTP::TFTP_RWA_HEADER_SIZE};
+                    const ssize_t bytes_sent = sendto(state.second, transmission_buffer, segment_size,
+                            0, (struct sockaddr *)&server_allocated_sockaddr, sizeof(server_allocated_sockaddr));
+
+                    if(segment_size != bytes_sent)
+                    {
+                        if(bytes_sent < 0)
+                        {
+                            perror("Failed to transmit file block in put request");
+                        }
+                        SigError(EUNDEF, state.second, server_allocated_sockaddr);
+                        return {TFTP::ErrorCode::SEND_ERROR, {}};
+                    }
+
+                    break;
+                }
+                default:
+                {
+                    printf("[%s] Unexpected assert packet returned: %s\n", __func__,
+                            TFTP::TFPT_PKT_RESULT_ToString(result).c_str());
+                    break;
+                }
+            }
+
+            if(valid_packet)
+            {
+                last_valid_op_step = time(NULL);
+            }
+            else if(difftime(time(NULL), last_valid_op_step) > send_timeout.tv_sec)
+            {
+                printf("[%s] Put operation has timeout after %ld seconds, aborting...\n",
+                        __func__, send_timeout.tv_sec);
+                //Too many invalid packets, signal error and give up
+                SigError((result == TFTP::TFPT_PKT_RESULT::PKT_UNEXPECTED_OPCODE) ? EBADOP : EBADID,
+                        state.second, server_allocated_sockaddr);
+                return {ErrorCode::OPERATION_TIMEOUT, {}};
+            }
+            else
+            {
+                //Do nothing, wait for retransmission of a valid packet
+            }
+        }
+        else
+        {
+            const int sys_errno = errno;
+            perror("Failed to receive packet");
+            //Signal an error to prevent server from keep retransmission
+            SigError(EUNDEF, state.second, server_allocated_sockaddr);
+            err_code = (sys_errno == EAGAIN) ? TFTP::ErrorCode::OPERATION_TIMEOUT : TFTP::ErrorCode::SEND_REQ_ERROR;
+            return {err_code, {}};
+        }
+    }
+
+    printf("[%s] Put request to %s finished successfully!\n", __func__, file_path.c_str());
+
+    return {TFTP::ErrorCode::NO_ERROR, {}};
 }
 
 const std::pair<TFTP::ErrorCode, size_t> TFTPClient::Get(const std::string& remote_path, std::shared_ptr<uint8_t> ptr, const size_t buffer_size)
@@ -576,12 +692,23 @@ const std::pair<TFTP::ErrorCode, size_t> TFTPClient::Get(const std::string& remo
 	return {GetRequest(remote_path, mutable_ptr, buffer_size), mutable_ptr.ptr_pos - mutable_ptr.ptr_head};
 }
 
+const std::pair<TFTP::ErrorCode, size_t> TFTPClient::Get(const std::string& remote_path, uint8_t* ptr, const size_t buffer_size)
+{
+	if(ptr == nullptr)
+	{
+		return{TFTP::ErrorCode::INVALID_BUFFER, 0};
+	}
+
+	BufferPtrWrapper mutable_ptr{ptr, ptr};
+	return {GetRequest(remote_path, mutable_ptr, buffer_size), mutable_ptr.ptr_pos - mutable_ptr.ptr_head};
+}
+
 const TFTP::ErrorCode TFTPClient::GetToPath(const std::string& remote_path, const std::string& local_path)
 {
 	std::ofstream outfile(local_path, std::ios::binary | std::ios::out | std::ios::trunc);
 	if(!outfile)
 	{
-		printf("[%s] Failed to open/create file in local machine", __func__);
+		printf("[%s] Failed to open/create file in local machine\n", __func__);
 		return TFTP::ErrorCode::FILE_OPEN_ERROR;
 	}
 
@@ -599,30 +726,26 @@ const TFTP::ErrorCode TFTPClient::GetToPath(const std::string& remote_path, cons
 	return err_code;
 }
 
-const TFTP::ErrorCode TFTPClient::Put(const std::string& remote_path, const std::string& data)
-{
-	return PutRequest(remote_path, data, data.size() + 1);
-}
-
-const TFTP::ErrorCode TFTPClient::Put(const std::string& remote_path, const std::vector<uint8_t>& data)
-{
-	return PutRequest(remote_path, data, data.size() + 1);
-}
-
-const TFTP::ErrorCode TFTPClient::Put(const std::string& remote_path, std::shared_ptr<uint8_t> data, const size_t data_size)
+const std::pair<TFTP::ErrorCode, std::string> TFTPClient::Put(const std::string& remote_path, const std::shared_ptr<uint8_t> data, const size_t data_size)
 {
 	BufferPtrWrapper buffer_ptr{data.get(), data.get()};
 	return PutRequest(remote_path, buffer_ptr, data_size);
 }
 
-const TFTP::ErrorCode TFTPClient::PutToPath(const std::string& remote_path, const std::string& local_path)
+const std::pair<TFTP::ErrorCode, std::string> TFTPClient::Put(const std::string& remote_path, const uint8_t* data, const size_t data_size)
+{
+	BufferPtrWrapper buffer_ptr{const_cast<uint8_t *>(data), const_cast<uint8_t *>(data)};
+	return PutRequest(remote_path, buffer_ptr, data_size);
+}
+
+const std::pair<TFTP::ErrorCode, std::string> TFTPClient::PutFromLocalPath(const std::string& remote_path, const std::string& local_path)
 {
 	//Use POSIX functions since the map is going to be mapped in memory
     const int fd = open(local_path.c_str(), O_RDONLY);
     if(fd == -1)
     {
     	perror("Failed to open file for transmission");
-    	return TFTP::ErrorCode::FILE_OPEN_ERROR;
+    	return {TFTP::ErrorCode::FILE_OPEN_ERROR, {}};
     }
 
     // Determine the size of the file
@@ -636,11 +759,11 @@ const TFTP::ErrorCode TFTPClient::PutToPath(const std::string& remote_path, cons
     {
         perror("Failed to map file to be transmitted in memory");
         close(fd);
-        return TFTP::ErrorCode::FILE_MMAP_ERROR;
+        return {TFTP::ErrorCode::FILE_MMAP_ERROR, {}};
     }
 
     BufferPtrWrapper file_ptr{static_cast<uint8_t*>(file_memmap_ptr), static_cast<uint8_t*>(file_memmap_ptr)};
-    const TFTP::ErrorCode err_code = PutRequest(remote_path, file_ptr, file_size);
+    const auto err_code = PutRequest(remote_path, file_ptr, file_size);
 
     // Un-map the memory-mapped file
     munmap(file_memmap_ptr, file_size);
@@ -655,3 +778,45 @@ const std::string TFTPClient::GetLastErrorMessage() const
 {
 	return m_last_reported_error_msg;
 }
+
+/* Getters and Setters */
+const uint32_t TFTPClient::GetMaxRetransmissions() const
+{
+	return m_max_retransmissions;
+}
+
+void TFTPClient::SetMaxRetransmissions(const uint32_t max_retransmissions)
+{
+	m_max_retransmissions = max_retransmissions;
+}
+
+const time_t TFTPClient::GetReceiveTimeout() const
+{
+	return m_recv_timeout_secs.tv_sec;
+}
+
+void TFTPClient::SetReceiveTimeout(const time_t receive_timeout_seconds)
+{
+	m_recv_timeout_secs.tv_sec = receive_timeout_seconds;
+}
+
+const time_t TFTPClient::GetSendTimeout() const
+{
+	return m_send_timeout_secs.tv_sec;
+}
+
+void TFTPClient::SetSendTimeout(const time_t receive_timeout_seconds)
+{
+	m_send_timeout_secs.tv_sec = receive_timeout_seconds;
+}
+
+const std::string& TFTPClient::GetServerAddress() const
+{
+	return m_server_address;
+}
+
+const uint16_t TFTPClient::GetServerPort() const
+{
+	return m_server_port;
+}
+
