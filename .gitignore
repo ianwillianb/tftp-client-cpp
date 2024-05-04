@@ -3,3 +3,10 @@ Debug/*
 .cproject
 .settings/*
 /Debug/
+/build/*
+/CMakeFiles/*
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+Makefile
+tftp-client.pc
