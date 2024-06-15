@@ -14,6 +14,11 @@ SocketWrapper::SocketWrapper(const int sock_namespace, const int sock_style, con
     fd = socket(sock_namespace, sock_style, sock_protocol);
 }
 
+SocketWrapper::SocketWrapper(const int file_descriptor)
+{
+    fd = file_descriptor;
+}
+
 bool SocketWrapper::IsValid()
 {
     return fd >= 0;

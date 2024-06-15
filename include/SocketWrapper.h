@@ -20,6 +20,12 @@ class SocketWrapper
         SocketWrapper(const int sock_namespace, const int sock_style, const int sock_protocol);
 
         /**
+         * @brief SocketWrapper Wraps an existing socket file descriptor.
+         * @param file_descriptor The socket file descriptor.
+         */
+        SocketWrapper(const int file_descriptor);
+
+        /**
          * @brief SocketWrapper move constructor
          * @param other SocketWrapper object
          */
